@@ -5,23 +5,45 @@ from aiogram.types import Message
 from aiogram.filters import BaseFilter
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
-from sqlalchemy import select
+
+from sqlalchemy import select, func
 
 from ..models import Test, Question, Attempt, User
 from ..utils import make_test_public_id
-from sqlalchemy import select, func
-from aiogram.types import CallbackQuery
+
 router = Router()
 
-
-# ===================== Filters / FSM =====================
+# ===================== Filters =====================
 
 class AdminOnly(BaseFilter):
-    async def __call__(self, message: Message, config) -> bool:
-        return message.from_user.id in config.admin_ids
+    async def __call__(self, message: Message, config, sessionmaker) -> bool:
+        if message.from_user.id in config.admin_ids:
+            return True
 
-class DeleteTestFSM(StatesGroup):
-    waiting_test_id = State()
+        async with sessionmaker() as session:
+            q = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
+            u = q.scalar_one_or_none()
+        return bool(u and u.is_admin)
+
+class SuperAdminOnly(BaseFilter):
+    async def __call__(self, message: Message, config, sessionmaker) -> bool:
+        # env super admin
+        if message.from_user.id in config.admin_ids:
+            return True
+
+        async with sessionmaker() as session:
+            q = await session.execute(select(User).where(User.telegram_id == message.from_user.id))
+            u = q.scalar_one_or_none()
+        return bool(u and u.is_superadmin)
+# ===================== FSMs =====================
+@router.message(SuperAdminOnly(), F.text == "👑 Admin qo‘shish")
+async def add_admin_start(message: Message, state: FSMContext):
+    await state.set_state(AddAdminFSM.waiting_user_id)
+    await message.answer("Admin qilinadigan user telegram ID sini yuboring:")
+@router.message(SuperAdminOnly(), F.text == "❌ Adminni olish")
+async def remove_admin_start(message: Message, state: FSMContext):
+    await state.set_state(RemoveAdminFSM.waiting_user_id)
+    await message.answer("Adminlikdan olinadigan user telegram ID sini yuboring:")
 class CreateTestFSM(StatesGroup):
     title = State()
     duration_min = State()
@@ -39,13 +61,20 @@ class AdminWhoFSM(StatesGroup):
     waiting_test_id = State()
 
 
+class DeleteTestFSM(StatesGroup):
+    waiting_test_id = State()
+
+
+class AdminManageFSM(StatesGroup):
+    waiting_user_id = State()
+
+
 # ===================== Create Test =====================
 
 @router.message(AdminOnly(), F.text == "➕ Test yaratish")
 async def admin_create_test_start(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(CreateTestFSM.title)
-    await state.update_data(q_total=0, q_current=0, test_id=None)
     await message.answer("🧩 Test nomini kiriting:")
 
 
@@ -104,15 +133,11 @@ async def admin_create_test_qcount(message: Message, state: FSMContext, sessionm
         session.add(test)
         await session.commit()
         await session.refresh(test)
-
-        test_id = test.id  # needed after session close
+        test_id = test.id
 
     await state.update_data(test_id=test_id, public_id=public_id, q_total=q_total, q_current=1)
     await state.set_state(CreateTestFSM.q_text)
-    await message.answer(
-        f"✅ Test yaratildi. ID: {public_id}\n\n"
-        f"1-savol matnini yuboring:"
-    )
+    await message.answer(f"✅ Test yaratildi. ID: {public_id}\n\n1-savol matnini yuboring:")
 
 
 @router.message(CreateTestFSM.q_text)
@@ -180,7 +205,6 @@ async def admin_correct(message: Message, state: FSMContext, sessionmaker):
         session.add(q)
         await session.commit()
 
-    # next or finish
     if q_index >= q_total:
         await state.clear()
         await message.answer(f"🎉 Tayyor! Test ID: {data['public_id']}\nSavollar: {q_total}")
@@ -213,6 +237,7 @@ async def admin_tests_list(message: Message, sessionmaker):
 
 @router.message(AdminOnly(), F.text == "👥 Kimlar ishlagan")
 async def admin_who_start(message: Message, state: FSMContext):
+    await state.clear()
     await state.set_state(AdminWhoFSM.waiting_test_id)
     await message.answer("Qaysi test? Test ID kiriting (masalan: T38471):")
 
@@ -248,8 +273,13 @@ async def admin_who_show(message: Message, state: FSMContext, sessionmaker):
             f"• {user.full_name} (tg:{user.telegram_id}) — {att.score}/{att.total} ({att.percent}%) — {att.status}"
         )
     await message.answer("\n".join(lines))
+
+
+# ===================== Delete Test =====================
+
 @router.message(AdminOnly(), F.text == "🗑 Test o‘chirish")
 async def admin_delete_test_start(message: Message, state: FSMContext):
+    await state.clear()
     await state.set_state(DeleteTestFSM.waiting_test_id)
     await message.answer("🗑 Qaysi testni o‘chirasiz? Test ID kiriting (masalan: T89101):")
 
@@ -266,13 +296,11 @@ async def admin_delete_test_confirm(message: Message, state: FSMContext, session
             await message.answer("Test topilmadi.")
             return
 
-        # statistikani oldindan ko'rsatamiz
         q_count = await session.execute(select(func.count(Question.id)).where(Question.test_id == test.id))
         a_count = await session.execute(select(func.count(Attempt.id)).where(Attempt.test_id == test.id))
         questions = int(q_count.scalar() or 0)
         attempts = int(a_count.scalar() or 0)
 
-        # o‘chirish
         await session.delete(test)
         await session.commit()
 
@@ -282,3 +310,67 @@ async def admin_delete_test_confirm(message: Message, state: FSMContext, session
         f"• Urinishlar: {attempts}\n"
         f"(Urinishlar bilan birga javoblar ham o‘chirildi)"
     )
+
+
+# ===================== Admin manage (add/remove) =====================
+
+@router.message(AdminOnly(), F.text == "👑 Admin qo‘shish")
+async def admin_add_start(message: Message, state: FSMContext):
+    await state.clear()
+    await state.update_data(mode="add")
+    await state.set_state(AdminManageFSM.waiting_user_id)
+    await message.answer("Admin qilinadigan user telegram ID sini yuboring:")
+
+
+@router.message(AdminOnly(), F.text == "❌ Adminni olish")
+async def admin_remove_start(message: Message, state: FSMContext):
+    await state.clear()
+    await state.update_data(mode="remove")
+    await state.set_state(AdminManageFSM.waiting_user_id)
+    await message.answer("Adminlikdan olinadigan user telegram ID sini yuboring:")
+
+
+@router.message(AdminManageFSM.waiting_user_id)
+async def admin_manage_confirm(message: Message, state: FSMContext, sessionmaker, config):
+    raw = (message.text or "").strip()
+    if not raw.isdigit():
+        await message.answer("Faqat raqamli telegram ID yuboring.")
+        return
+
+    tg_id = int(raw)
+    data = await state.get_data()
+    mode = data.get("mode")
+
+    # o'zingizni olib tashlashni bloklash (xohlasangiz olib tashlang)
+    if mode == "remove" and message.from_user.id == tg_id and message.from_user.id in config.admin_ids:
+        await state.clear()
+        await message.answer("❌ Super admin o‘zini adminlikdan olib tashlay olmaydi.")
+        return
+
+    async with sessionmaker() as session:
+        q = await session.execute(select(User).where(User.telegram_id == tg_id))
+        user = q.scalar_one_or_none()
+
+        if not user:
+            await state.clear()
+            await message.answer("User ro‘yxatdan o‘tmagan.")
+            return
+
+        if mode == "add":
+            user.is_admin = True
+            user.is_superadmin = True
+            await session.commit()
+            await state.clear()
+            await message.answer(f"✅ Admin qo‘shildi: {user.full_name} ({tg_id})")
+            return
+
+        if mode == "remove":
+            user.is_admin = False
+            user.is_superadmin = False
+            await session.commit()
+            await state.clear()
+            await message.answer(f"❌ Adminlik olib tashlandi: {user.full_name} ({tg_id})")
+            return
+
+    await state.clear()
+    await message.answer("Xatolik: mode topilmadi. Qaytadan urinib ko‘ring.")
